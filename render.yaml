@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: gemini-telegram-bot
+    runtime: node
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DAILY_LIMIT
+        value: "50"
+      - key: COOLDOWN_SECONDS
+        value: "3"
+      - key: MAX_MEMORY
+        value: "20"
+    healthCheckPath: /health
+    autoDeploy: true

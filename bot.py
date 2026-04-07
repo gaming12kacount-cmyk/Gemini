@@ -1,379 +1,588 @@
 import os
 import asyncio
-import google.generativeai as genai
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from flask import Flask, request
 import threading
-from googletrans import Translator
-from PIL import Image
+import signal
+import logging
 import io
 from datetime import datetime
-import json
 
-# --- Configuration ---
+import google.generativeai as genai
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CallbackQueryHandler,
+)
+from telegram.constants import ParseMode, ChatAction
+from flask import Flask
+from PIL import Image
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Configuration  (set these in Render → Environment)
+# ---------------------------------------------------------------------------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY")
 PORT = int(os.environ.get("PORT", 8080))
 
-# --- Initialize ---
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN env var is missing!")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GOOGLE_API_KEY env var is missing!")
+
+# ---------------------------------------------------------------------------
+# Gemini setup
+# ---------------------------------------------------------------------------
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
-translator = Translator()
 
-# --- User Data Storage (In-memory, for demo) ---
-user_data = {}  # {user_id: {'language': 'en', 'history': [], 'preferences': {}}}
+_generation_config = {
+    "temperature": 0.85,
+    "top_p": 1,
+    "top_k": 1,
+    "max_output_tokens": 2048,
+}
 
-# --- Language Settings ---
+_safety_settings = [
+    {"category": "HARM_CATEGORY_HARASSMENT",        "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH",        "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",  "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",  "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+]
+
+chat_model   = genai.GenerativeModel("gemini-1.5-flash",
+                                     generation_config=_generation_config,
+                                     safety_settings=_safety_settings)
+vision_model = genai.GenerativeModel("gemini-1.5-flash",
+                                     safety_settings=_safety_settings)
+
+# ---------------------------------------------------------------------------
+# Language config
+# ---------------------------------------------------------------------------
 LANGUAGES = {
-    'en': '🇬🇧 English',
-    'bn': '🇧🇩 বাংলা',
-    'ur': '🇵🇰 اردو',
-    'ar': '🇸🇦 العربية',
-    'zh-cn': '🇨🇳 中文'
+    "en":    "🇬🇧 English",
+    "bn":    "🇧🇩 বাংলা",
+    "ur":    "🇵🇰 اردو",
+    "ar":    "🇸🇦 العربية",
+    "hi":    "🇮🇳 हिंदी",
+    "zh-cn": "🇨🇳 中文",
+}
+LANG_NAMES = {
+    "en":    "English",
+    "bn":    "Bengali",
+    "ur":    "Urdu",
+    "ar":    "Arabic",
+    "hi":    "Hindi",
+    "zh-cn": "Chinese (Simplified)",
 }
 
-# Welcome messages in different languages
-WELCOME_MSGS = {
-    'en': "Hello! I'm your multilingual AI assistant. I can:\n✅ Answer questions\n✅ Analyze images\n✅ Translate between 5 languages\n✅ Remember conversations\n✅ Read files\n\nSend me text, image, or file!",
-    'bn': "হ্যালো! আমি আপনার বহুভাষিক AI সহকারী। আমি পারি:\n✅ প্রশ্নের উত্তর দিতে\n✅ ছবি বিশ্লেষণ করতে\n✅ ৫টি ভাষায় অনুবাদ করতে\n✅ কথোপকথন মনে রাখতে\n✅ ফাইল পড়তে\n\nআমাকে টেক্সট, ছবি বা ফাইল পাঠান!",
-    'ur': "ہیلو! میں آپ کا کثیر لسانی AI معاون ہوں۔ میں کر سکتا ہوں:\n✅ سوالات کے جوابات\n✅ تصاویر کا تجزیہ\n✅ 5 زبانوں میں ترجمہ\n✅ بات چیت یاد رکھنا\n✅ فائلیں پڑھنا\n\nمجھے متن، تصویر یا فائل بھیجیں!",
-    'ar': "مرحباً! أنا مساعدك الذكي متعدد اللغات. يمكنني:\n✅ الإجابة على الأسئلة\n✅ تحليل الصور\n✅ الترجمة بين 5 لغات\n✅ تذكر المحادثات\n✅ قراءة الملفات\n\nأرسل لي نصاً أو صورة أو ملفاً!",
-    'zh-cn': "你好！我是你的多语言AI助手。我可以：\n✅ 回答问题\n✅ 分析图片\n✅ 在5种语言之间翻译\n✅ 记住对话\n✅ 阅读文件\n\n发送文本、图片或文件给我！"
-}
+# ---------------------------------------------------------------------------
+# In-memory user store
+# ---------------------------------------------------------------------------
+user_store: dict[int, dict] = {}
 
-# --- Helper Functions ---
-def get_user_language(user_id):
-    return user_data.get(user_id, {}).get('language', 'en')
 
-def set_user_language(user_id, lang_code):
-    if user_id not in user_data:
-        user_data[user_id] = {'history': [], 'preferences': {}}
-    user_data[user_id]['language'] = lang_code
+def get_user(user_id: int) -> dict:
+    if user_id not in user_store:
+        user_store[user_id] = {
+            "language": "en",
+            "history": [],       # list of {"role": "user"|"assistant", "content": str}
+            "msg_count": 0,
+        }
+    return user_store[user_id]
 
-def add_to_history(user_id, question, answer):
-    if user_id not in user_data:
-        user_data[user_id] = {'language': 'en', 'history': [], 'preferences': {}}
-    user_data[user_id]['history'].append({
-        'question': question,
-        'answer': answer,
-        'timestamp': datetime.now().isoformat()
-    })
-    # Keep only last 10 conversations
-    if len(user_data[user_id]['history']) > 10:
-        user_data[user_id]['history'].pop(0)
 
-def get_history_context(user_id):
-    if user_id not in user_data:
-        return ""
-    history = user_data[user_id]['history'][-5:]  # Last 5 conversations
-    context = "Previous conversation:\n"
-    for item in history:
-        context += f"User: {item['question']}\nAI: {item['answer']}\n"
-    return context
+def add_history(user_id: int, role: str, content: str) -> None:
+    user = get_user(user_id)
+    user["history"].append({"role": role, "content": content})
+    if len(user["history"]) > 20:
+        user["history"] = user["history"][-20:]
 
-async def translate_text(text, target_lang):
-    """Translate text to target language"""
-    try:
-        translated = await translator.translate(text, dest=target_lang)
-        return translated.text
-    except:
-        return text
 
-# --- Flask app for health checks ---
-flask_app = Flask(__name__)
+def build_context(user_id: int, limit: int = 6) -> str:
+    user = get_user(user_id)
+    recent = user["history"][-limit:]
+    lines = []
+    for h in recent:
+        prefix = "User" if h["role"] == "user" else "Assistant"
+        lines.append(f"{prefix}: {h['content']}")
+    return "\n".join(lines)
 
-@flask_app.route('/')
-def health_check():
-    return "Bot is running!", 200
 
-@flask_app.route('/webhook', methods=['POST'])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot_app.bot)
-    asyncio.create_task(bot_app.process_update(update))
-    return 'ok', 200
+# ---------------------------------------------------------------------------
+# Gemini helpers
+# ---------------------------------------------------------------------------
+async def gemini_chat(prompt: str, user_id: int | None = None) -> str:
+    ctx = build_context(user_id) if user_id else ""
+    full_prompt = (
+        f"Previous conversation:\n{ctx}\n\nUser: {prompt}\nAssistant:"
+        if ctx else prompt
+    )
+    response = await asyncio.to_thread(chat_model.generate_content, full_prompt)
+    return response.text
 
-# --- Bot Handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    keyboard = [
-        [InlineKeyboardButton("🇬🇧 English", callback_data='lang_en'),
-         InlineKeyboardButton("🇧🇩 বাংলা", callback_data='lang_bn')],
-        [InlineKeyboardButton("🇵🇰 اردو", callback_data='lang_ur'),
-         InlineKeyboardButton("🇸🇦 العربية", callback_data='lang_ar')],
-        [InlineKeyboardButton("🇨🇳 中文", callback_data='lang_zh-cn')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+
+async def gemini_vision(image: Image.Image, prompt: str) -> str:
+    response = await asyncio.to_thread(vision_model.generate_content, [prompt, image])
+    return response.text
+
+
+async def gemini_translate(text: str, target_lang: str) -> str:
+    lang_name = LANG_NAMES.get(target_lang, target_lang)
+    prompt = (
+        f"Translate the following text to {lang_name}. "
+        "Return ONLY the translated text, with no preamble or explanation:\n\n"
+        f"{text}"
+    )
+    return await gemini_chat(prompt)
+
+
+# ---------------------------------------------------------------------------
+# Telegram helpers
+# ---------------------------------------------------------------------------
+async def send_long(update: Update, text: str, **kwargs) -> None:
+    """Send text, splitting if > 4000 chars."""
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i : i + 4000], **kwargs)
+
+
+def lang_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🇬🇧 English", callback_data="lang_en"),
+         InlineKeyboardButton("🇧🇩 বাংলা",   callback_data="lang_bn")],
+        [InlineKeyboardButton("🇵🇰 اردو",    callback_data="lang_ur"),
+         InlineKeyboardButton("🇸🇦 العربية",  callback_data="lang_ar")],
+        [InlineKeyboardButton("🇮🇳 हिंदी",   callback_data="lang_hi"),
+         InlineKeyboardButton("🇨🇳 中文",     callback_data="lang_zh-cn")],
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    name = update.effective_user.first_name
+    get_user(update.effective_user.id)
     await update.message.reply_text(
-        "Welcome! 🌟\nPlease choose your language / আপনার ভাষা নির্বাচন করুন:",
-        reply_markup=reply_markup
+        f"👋 *Welcome {name}!*\n\n"
+        "I'm your *Gemini AI Assistant* powered by Google's free API.\n\n"
+        "Choose your language to get started:",
+        reply_markup=lang_keyboard(),
+        parse_mode=ParseMode.MARKDOWN,
     )
 
-async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🤖 *Gemini AI Bot — Commands*\n\n"
+        "/start — Welcome & language setup\n"
+        "/help — Show this message\n"
+        "/lang — Change language\n"
+        "/clear — Clear chat history\n"
+        "/history — Summarize your conversation\n"
+        "/translate `<lang>` `<text>` — Translate text\n"
+        "  _e.g._ `/translate bn Hello world`\n"
+        "/imagine `<prompt>` — Creative description\n"
+        "/code `<question>` — Help with code\n"
+        "/about — About this bot\n\n"
+        "*Send me any of these:*\n"
+        "🖼 Photo → image analysis\n"
+        "📄 File (txt/code/csv) → summarize & analyse\n"
+        "🎤 Voice → (transcription coming soon)\n\n"
+        "*Lang codes:* `en` `bn` `ur` `ar` `hi` `zh-cn`",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🤖 *Gemini AI Telegram Bot*\n\n"
+        "Version: 3.0 (Render-ready)\n"
+        "Engine: *Google Gemini 1.5 Flash* — Free Tier\n"
+        "Framework: python-telegram-bot 20.x\n\n"
+        "*Features:*\n"
+        "• Multilingual chat (6 languages)\n"
+        "• Image & photo analysis\n"
+        "• File reading & summarisation\n"
+        "• Conversation memory (last 20 msgs)\n"
+        "• Translation powered by Gemini\n"
+        "• Creative text generation\n"
+        "• Code assistance\n\n"
+        "Built for Render free-tier deployment ✅",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("🌐 Choose your language:", reply_markup=lang_keyboard())
+
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    get_user(update.effective_user.id)["history"] = []
+    await update.message.reply_text("✅ Conversation history cleared!")
+
+
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+
+    if not user["history"]:
+        await update.message.reply_text("📭 No conversation history yet. Start chatting!")
+        return
+
+    await update.message.reply_chat_action(ChatAction.TYPING)
+    ctx = build_context(user_id, limit=20)
+    summary = await gemini_chat(
+        f"Summarize this conversation in 4-6 bullet points. Be concise:\n\n{ctx}"
+    )
+    await send_long(update, f"📋 *Conversation Summary*\n\n{summary}", parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: `/translate <lang> <text>`\n\n"
+            "Codes: `en` `bn` `ur` `ar` `hi` `zh-cn`\n"
+            "Example: `/translate bn Hello, how are you?`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    target = args[0].lower()
+    text = " ".join(args[1:])
+
+    if target not in LANG_NAMES:
+        await update.message.reply_text(
+            f"❌ Unknown code `{target}`\n"
+            f"Available: {', '.join(f'`{k}`' for k in LANG_NAMES)}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await update.message.reply_chat_action(ChatAction.TYPING)
+    try:
+        translated = await gemini_translate(text, target)
+        await update.message.reply_text(
+            f"🌐 *→ {LANG_NAMES[target]}*\n\n"
+            f"*Original:* {text}\n\n"
+            f"*Translated:* {translated}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.error(f"Translate error: {e}")
+        await update.message.reply_text("❌ Translation failed. Please try again.")
+
+
+async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/imagine <your idea>`\n"
+            "Example: `/imagine a futuristic city underwater at night`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    prompt = " ".join(context.args)
+    await update.message.reply_chat_action(ChatAction.TYPING)
+    try:
+        result = await gemini_chat(
+            f"Write a vivid, imaginative, and poetic description of: {prompt}\n"
+            "Make it creative, sensory, and engaging. Around 150-200 words."
+        )
+        await send_long(update, f"✨ *{prompt}*\n\n{result}", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Imagine error: {e}")
+        await update.message.reply_text("❌ Could not generate. Try again with a different prompt.")
+
+
+async def cmd_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/code <your question>`\n"
+            "Example: `/code how do I sort a list in Python?`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    question = " ".join(context.args)
+    await update.message.reply_chat_action(ChatAction.TYPING)
+    try:
+        result = await gemini_chat(
+            f"You are an expert programmer. Answer this coding question clearly with examples:\n\n{question}"
+        )
+        await send_long(update, result)
+    except Exception as e:
+        logger.error(f"Code error: {e}")
+        await update.message.reply_text("❌ Could not answer. Try again.")
+
+
+# ---------------------------------------------------------------------------
+# Callback query handler
+# ---------------------------------------------------------------------------
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    
+    data = query.data
     user_id = query.from_user.id
-    lang_code = query.data.split('_')[1]
-    set_user_language(user_id, lang_code)
-    
-    welcome_msg = WELCOME_MSGS.get(lang_code, WELCOME_MSGS['en'])
-    await query.edit_message_text(welcome_msg)
-    
-    # Show additional options
-    keyboard = [
-        [InlineKeyboardButton("📝 Help", callback_data='help'),
-         InlineKeyboardButton("🗑 Clear History", callback_data='clear')],
-        [InlineKeyboardButton("🌐 Change Language", callback_data='change_lang')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.reply_text("What would you like to do?", reply_markup=reply_markup)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if data.startswith("lang_"):
+        lang_code = data[5:]          # strip "lang_"
+        user = get_user(user_id)
+        user["language"] = lang_code
+        lang_label = LANGUAGES.get(lang_code, lang_code)
+        await query.edit_message_text(
+            f"✅ Language set to *{lang_label}*!\n\n"
+            "Send me any message to start chatting.\n"
+            "Use /help to see all commands.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    elif data == "change_lang":
+        await query.edit_message_text("🌐 Choose your language:", reply_markup=lang_keyboard())
+
+    elif data == "clear":
+        get_user(user_id)["history"] = []
+        await query.edit_message_text("✅ History cleared!")
+
+    elif data == "help":
+        await query.edit_message_text("Use /help to see all commands.")
+
+
+# ---------------------------------------------------------------------------
+# Message handlers
+# ---------------------------------------------------------------------------
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    lang = get_user_language(user_id)
-    
-    help_texts = {
-        'en': "📚 *Available Commands:*\n"
-              "/start - Restart bot\n"
-              "/help - Show this help\n"
-              "/clear - Clear conversation history\n"
-              "/lang - Change language\n"
-              "/about - About this bot\n\n"
-              "*Features:*\n"
-              "✅ Text questions\n"
-              "✅ Image analysis\n"
-              "✅ File reading (PDF, TXT)\n"
-              "✅ Auto-translation\n"
-              "✅ Conversation memory",
-        
-        'bn': "📚 *উপলব্ধ কমান্ড:*\n"
-              "/start - বোট রিস্টার্ট\n"
-              "/help - সাহায্য দেখুন\n"
-              "/clear - ইতিহাস মুছুন\n"
-              "/lang - ভাষা পরিবর্তন\n"
-              "/about - বোট সম্পর্কে\n\n"
-              "*ফিচার:*\n"
-              "✅ টেক্সট প্রশ্ন\n"
-              "✅ ছবি বিশ্লেষণ\n"
-              "✅ ফাইল পড়া\n"
-              "✅ স্বয়ংক্রিয় অনুবাদ\n"
-              "✅ কথোপকথন মেমরি",
-        
-        'ur': "📚 *دستیاب کمانڈز:*\n"
-              "/start - بوٹ دوبارہ شروع کریں\n"
-              "/help - یہ مدد دکھائیں\n"
-              "/clear - تاریخچہ صاف کریں\n"
-              "/lang - زبان تبدیل کریں\n"
-              "/about - بوٹ کے بارے میں\n\n"
-              "*خصوصیات:*\n"
-              "✅ متنی سوالات\n"
-              "✅ تصویری تجزیہ\n"
-              "✅ فائل پڑھنا\n"
-              "✅ خودکار ترجمہ\n"
-              "✅ گفتگو کی میموری"
-    }
-    
-    help_text = help_texts.get(lang, help_texts['en'])
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    user = get_user(user_id)
+    lang = user.get("language", "en")
+    msg = update.message.text
 
-async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in user_data:
-        user_data[user_id]['history'] = []
-    
-    lang = get_user_language(user_id)
-    msgs = {
-        'en': "✅ Conversation history cleared!",
-        'bn': "✅ কথোপকথনের ইতিহাস মুছে ফেলা হয়েছে!",
-        'ur': "✅ گفتگو کی تاریخ صاف کر دی گئی!",
-        'ar': "✅ تم مسح تاريخ المحادثة!",
-        'zh-cn': "✅ 对话历史已清除！"
-    }
-    await update.message.reply_text(msgs.get(lang, msgs['en']))
+    await update.message.reply_chat_action(ChatAction.TYPING)
 
-async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    lang = get_user_language(user_id)
-    
-    about_texts = {
-        'en': "🤖 *Gemini AI Telegram Bot*\n\n"
-              "Version: 2.0\n"
-              "Powered by: Google Gemini AI\n"
-              "Features: Multi-language, Image Analysis, File Reading\n"
-              "Languages: English, বাংলা, اردو, العربية, 中文\n\n"
-              "Created with ❤️ for the community",
-        
-        'bn': "🤖 *জেমিনাই এআই টেলিগ্রাম বোট*\n\n"
-              "ভার্সন: ২.০\n"
-              "চালিত: গুগল জেমিনাই এআই\n"
-              "ফিচার: বহুভাষিক, ছবি বিশ্লেষণ, ফাইল পড়া\n"
-              "ভাষা: ইংরেজি, বাংলা, উর্দু, আরবি, চাইনিজ\n\n"
-              "কমিউনিটির জন্য ❤️ দিয়ে তৈরি"
-    }
-    
-    about_text = about_texts.get(lang, about_texts['en'])
-    await update.message.reply_text(about_text, parse_mode='Markdown')
-
-async def change_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query:
-        await query.answer()
-        message = query.message
-    else:
-        message = update.message
-    
-    keyboard = [
-        [InlineKeyboardButton("🇬🇧 English", callback_data='lang_en'),
-         InlineKeyboardButton("🇧🇩 বাংলা", callback_data='lang_bn')],
-        [InlineKeyboardButton("🇵🇰 اردو", callback_data='lang_ur'),
-         InlineKeyboardButton("🇸🇦 العربية", callback_data='lang_ar')],
-        [InlineKeyboardButton("🇨🇳 中文", callback_data='lang_zh-cn')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if query:
-        await query.edit_message_text("Select your language:", reply_markup=reply_markup)
-    else:
-        await message.reply_text("Select your language:", reply_markup=reply_markup)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_message = update.message.text
-    lang = get_user_language(user_id)
-    
-    await update.message.reply_chat_action(action="typing")
-    
     try:
-        # Get conversation history for context
-        context_history = get_history_context(user_id)
-        
-        # Prepare prompt with context
-        prompt = f"{context_history}\nUser: {user_message}\nAI: "
-        
-        # Get response from Gemini
-        response = await asyncio.to_thread(model.generate_content, prompt)
-        reply = response.text
-        
-        # Translate response to user's language if needed
-        if lang != 'en':
-            reply = await translate_text(reply, lang)
-        
-        # Save to history
-        add_to_history(user_id, user_message, reply)
-        
-        await update.message.reply_text(reply)
-        
+        reply = await gemini_chat(msg, user_id)
+
+        if lang != "en":
+            reply = await gemini_translate(reply, lang)
+
+        add_history(user_id, "user",      msg[:300])
+        add_history(user_id, "assistant", reply[:300])
+
+        await send_long(update, reply)
+
     except Exception as e:
-        print(f"Error: {e}")
-        error_msg = {
-            'en': "Sorry, I encountered an error. Please try again.",
-            'bn': "দুঃখিত, একটি ত্রুটি হয়েছে। আবার চেষ্টা করুন।",
-            'ur': "معذرت، ایک خرابی پیش آگئی۔ براہ کرم دوبارہ کوشش کریں۔",
-            'ar': "عذرًا، لقد حدث خطأ. يرجى المحاولة مرة أخرى.",
-            'zh-cn': "抱歉，我遇到了错误。请再试一次。"
+        logger.error(f"Text handler error: {e}")
+        err = {
+            "en": "⚠️ Something went wrong. Please try again.",
+            "bn": "⚠️ কিছু একটা ভুল হয়েছে। আবার চেষ্টা করুন।",
+            "ur": "⚠️ کچھ غلط ہوا۔ دوبارہ کوشش کریں۔",
+            "ar": "⚠️ حدث خطأ. حاول مرة أخرى.",
+            "hi": "⚠️ कुछ गलत हुआ। कृपया पुनः प्रयास करें।",
+            "zh-cn": "⚠️ 出了点问题，请再试一次。",
         }
-        await update.message.reply_text(error_msg.get(lang, error_msg['en']))
+        await update.message.reply_text(err.get(lang, err["en"]))
 
-async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    lang = get_user_language(user_id)
-    
-    await update.message.reply_chat_action(action="upload_photo")
-    
+    lang = get_user(user_id).get("language", "en")
+    caption = update.message.caption or "Describe this image in detail. What do you see?"
+
+    await update.message.reply_chat_action(ChatAction.UPLOAD_PHOTO)
+
     try:
-        # Get the photo
         photo_file = await update.message.photo[-1].get_file()
-        image_bytes = await photo_file.download_as_bytearray()
-        
-        # Open image
-        image = Image.open(io.BytesIO(image_bytes))
-        
-        # Generate description using Gemini
-        prompt = "Describe this image in detail. What do you see?"
-        response = await asyncio.to_thread(model.generate_content, [prompt, image])
-        reply = response.text
-        
-        # Translate if needed
-        if lang != 'en':
-            reply = await translate_text(reply, lang)
-        
-        await update.message.reply_text(reply)
-        
-    except Exception as e:
-        print(f"Image error: {e}")
-        await update.message.reply_text("Sorry, couldn't process the image.")
+        raw = await photo_file.download_as_bytearray()
+        image = Image.open(io.BytesIO(raw))
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        reply = await gemini_vision(image, caption)
+
+        if lang != "en":
+            reply = await gemini_translate(reply, lang)
+
+        add_history(user_id, "user",      f"[Photo] {caption}")
+        add_history(user_id, "assistant", reply[:300])
+
+        await send_long(update, reply)
+
+    except Exception as e:
+        logger.error(f"Photo handler error: {e}")
+        await update.message.reply_text("❌ Could not analyse the image. Please try again.")
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    lang = get_user_language(user_id)
-    
-    await update.message.reply_chat_action(action="typing")
-    
+    lang = get_user(user_id).get("language", "en")
+    doc = update.message.document
+
+    if doc.file_size and doc.file_size > 5 * 1024 * 1024:
+        await update.message.reply_text("❌ File too large (max 5 MB). Please compress and resend.")
+        return
+
+    await update.message.reply_chat_action(ChatAction.TYPING)
+
     try:
-        # Get file
-        document = update.message.document
-        file = await document.get_file()
-        file_bytes = await file.download_as_bytearray()
-        
-        # Try to read as text
+        file = await doc.get_file()
+        raw = await file.download_as_bytearray()
+        fname = doc.file_name or "file"
+
+        # Attempt UTF-8, fall back to latin-1
         try:
-            file_content = file_bytes.decode('utf-8')
-        except:
-            file_content = str(file_bytes[:500])  # First 500 bytes if binary
-        
-        # Ask Gemini to summarize
-        prompt = f"Please summarize or analyze this file content:\n\n{file_content[:3000]}"
-        response = await asyncio.to_thread(model.generate_content, prompt)
-        reply = response.text
-        
-        # Translate if needed
-        if lang != 'en':
-            reply = await translate_text(reply, lang)
-        
-        await update.message.reply_text(reply[:4000])  # Telegram limit
-        
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                content = raw.decode("latin-1")
+            except Exception:
+                await update.message.reply_text(
+                    "❌ Cannot read this file format.\n"
+                    "Supported: plain text, code files, CSV, JSON, etc."
+                )
+                return
+
+        if len(content) > 8000:
+            content = content[:8000] + "\n...[truncated at 8000 chars]"
+
+        question = update.message.caption or "Summarise and analyse this file. What is it about?"
+        prompt = f"File name: {fname}\n\nContent:\n{content}\n\nTask: {question}"
+
+        reply = await gemini_chat(prompt)
+
+        if lang != "en":
+            reply = await gemini_translate(reply, lang)
+
+        add_history(user_id, "user",      f"[File: {fname}] {question}")
+        add_history(user_id, "assistant", reply[:300])
+
+        header = f"📄 *Analysis: {fname}*\n\n"
+        await send_long(update, header + reply, parse_mode=ParseMode.MARKDOWN)
+
     except Exception as e:
-        print(f"File error: {e}")
-        await update.message.reply_text("Sorry, couldn't process the file.")
+        logger.error(f"Document handler error: {e}")
+        await update.message.reply_text("❌ Could not process the file. Please try again.")
 
-# --- Main Function ---
-async def post_init(application: Application):
-    await application.bot.set_webhook(f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/webhook")
 
-def run_flask():
-    flask_app.run(host='0.0.0.0', port=PORT)
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🎤 Voice message received!\n\n"
+        "Voice transcription is not supported yet.\n"
+        "Please type your message as text. 📝"
+    )
 
-def main():
-    global bot_app
-    bot_app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-    
-    # Command handlers
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("help", help_command))
-    bot_app.add_handler(CommandHandler("clear", clear_history))
-    bot_app.add_handler(CommandHandler("about", about_command))
-    bot_app.add_handler(CommandHandler("lang", change_language))
-    
-    # Callback handlers
-    bot_app.add_handler(CallbackQueryHandler(language_callback, pattern='^lang_'))
-    bot_app.add_handler(CallbackQueryHandler(change_language, pattern='^change_lang'))
-    bot_app.add_handler(CallbackQueryHandler(help_command, pattern='^help'))
-    bot_app.add_handler(CallbackQueryHandler(clear_history, pattern='^clear'))
-    
-    # Message handlers
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    bot_app.add_handler(MessageHandler(filters.PHOTO, handle_image))
-    bot_app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-    
-    # Start Flask in a separate thread
-    flask_thread = threading.Thread(target=run_flask)
+
+async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    responses = [
+        "😄 Nice sticker! Got something to ask?",
+        "👍 Cool! What can I help you with?",
+        "🤖 Sticker noted! Type a message to chat.",
+    ]
+    import random
+    await update.message.reply_text(random.choice(responses))
+
+
+# ---------------------------------------------------------------------------
+# Flask health-check server  (keeps Render web service alive)
+# ---------------------------------------------------------------------------
+flask_app = Flask(__name__)
+
+
+@flask_app.route("/")
+def health_root():
+    return (
+        '{"status":"ok","service":"Gemini Telegram Bot","version":"3.0"}',
+        200,
+        {"Content-Type": "application/json"},
+    )
+
+
+@flask_app.route("/health")
+def health():
+    return "OK", 200
+
+
+def run_flask() -> None:
+    import logging as _log
+    _log.getLogger("werkzeug").setLevel(_log.ERROR)
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
+
+# ---------------------------------------------------------------------------
+# Bot runner
+# ---------------------------------------------------------------------------
+async def run_bot() -> None:
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("help",      cmd_help))
+    app.add_handler(CommandHandler("about",     cmd_about))
+    app.add_handler(CommandHandler("lang",      cmd_lang))
+    app.add_handler(CommandHandler("clear",     cmd_clear))
+    app.add_handler(CommandHandler("history",   cmd_history))
+    app.add_handler(CommandHandler("translate", cmd_translate))
+    app.add_handler(CommandHandler("imagine",   cmd_imagine))
+    app.add_handler(CommandHandler("code",      cmd_code))
+
+    # Inline buttons
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    # Messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,  handle_text))
+    app.add_handler(MessageHandler(filters.PHOTO,                    handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL,             handle_document))
+    app.add_handler(MessageHandler(filters.VOICE,                    handle_voice))
+    app.add_handler(MessageHandler(filters.Sticker.ALL,              handle_sticker))
+
+    # Graceful shutdown on SIGTERM / SIGINT
+    stop_event = asyncio.Event()
+    loop = asyncio.get_event_loop()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            pass  # Windows doesn't support add_signal_handler
+
+    logger.info("Starting Telegram polling ...")
+
+    async with app:
+        await app.start()
+        await app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+        logger.info("✅ Bot is live and polling!")
+        await stop_event.wait()          # block until shutdown signal
+        logger.info("Shutting down ...")
+        await app.updater.stop()
+        await app.stop()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def main() -> None:
+    logger.info("=== Gemini Telegram Bot v3.0 starting ===")
+
+    # Flask runs in a background daemon thread so Render health checks pass
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    
-    print("Bot is running with all features...")
-    
-    # Run the bot
-    bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info(f"Health server listening on port {PORT}")
+
+    # Bot runs in the main thread
+    asyncio.run(run_bot())
+
 
 if __name__ == "__main__":
     main()
